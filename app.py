@@ -381,21 +381,44 @@ if page == "Главная":
         download_button_for_df(rf_view, "⬇️ Скачать атрибуты отчёта (Excel)", f"report_{rid}_attrs.xlsx")
 
     # ------------------- TAB 5: Линейность -----------------------------------
+    # ------------------- TAB 5: Линейность -----------------------------------
     with tab5:
         st.subheader("Data Lineage")
-
-        mode = st.radio("Режим", ["Глобально", "По отчёту"], horizontal=True)
-        if mode == "По отчёту":
-            rep_name = st.selectbox("Выберите отчёт", options=reports["name"].tolist())
-            rid = int(reports[reports["name"]==rep_name].iloc[0]["report_id"])
-        else:
-            rid = None
-
+    
+        # Явный выбор отчёта всегда виден: первое значение — глобальный режим
+        report_options = ["— Все отчёты —"] + reports["name"].dropna().astype(str).unique().tolist()
+        selected_report_name = st.selectbox("Отчёт для фильтрации (по умолчанию — все)", options=report_options, index=0)
+    
+        # (необязательно) Доп. фильтры по слоям/системам — можешь расширить позже
+        colf1, colf2 = st.columns(2)
+        with colf1:
+            layer_filter = st.multiselect("Слой", ["vitrine","raw"], default=["vitrine","raw"])
+        with colf2:
+            systems = sorted(datasets["system"].dropna().unique().tolist())
+            system_filter = st.multiselect("Система", systems, default=systems)
+    
+        # строим полный граф
         edges_all = build_lineage_edges(dataset_fields, report_fields)
-        edges = filter_edges_by_report(edges_all, rid)
-
+    
+        # применяем фильтр по отчёту
+        edges = filter_edges_by_report_name(edges_all, reports, None if selected_report_name == "— Все отчёты —" else selected_report_name)
+    
+        # (необязательно) применим простую фильтрацию по слоям/системам
+        if layer_filter or system_filter:
+            # Для эффективности построим множества допустимых датасетов
+            allowed_ds = set(
+                datasets[(datasets["layer"].isin(layer_filter)) & (datasets["system"].isin(system_filter))]["name"].tolist()
+            )
+            def edge_ok(s, t):
+                # Разрешаем, если dataset в allowed_ds, либо это не dataset-узел
+                def is_dataset(n): return isinstance(n, str) and (n.count(".")==1)  # schema.table
+                if is_dataset(s) and s not in allowed_ds:
+                    return False
+                return True
+            edges = [e for e in edges if edge_ok(e[0], e[1])]
+    
         viz = st.radio("Тип визуализации", ["Граф (интерактивный)", "Sankey"], horizontal=True)
-
+    
         if viz == "Граф (интерактивный)":
             net = pyvis_graph(edges, reports, datasets, height="650px")
             # Безопасный рендер HTML для разных версий pyvis
@@ -406,7 +429,6 @@ if page == "Главная":
                 except Exception:
                     html = None
             if html is None:
-                # fallback: пишем файл и читаем
                 tmp_path = "lineage_tmp.html"
                 try:
                     net.write_html(tmp_path)
@@ -414,16 +436,18 @@ if page == "Главная":
                         html = f.read()
                 except Exception:
                     html = "<html><body><p>Не удалось сгенерировать граф PyVis.</p></body></html>"
-
+    
+            st.caption(f"Показано: {selected_report_name if selected_report_name!='— Все отчёты —' else 'все отчёты'}")
             components.html(html, height=680, scrolling=True)
             st.download_button(
                 "⬇️ Скачать граф (HTML)",
                 data=html.encode("utf-8"),
-                file_name=f"lineage_{'report_'+str(rid) if rid else 'global'}.html",
+                file_name=f"lineage_{'all' if selected_report_name=='— Все отчёты —' else selected_report_name}.html",
                 mime="text/html"
             )
         else:
             fig = sankey_figure(edges)
+            st.caption(f"Показано: {selected_report_name if selected_report_name!='— Все отчёты —' else 'все отчёты'}")
             st.plotly_chart(fig, use_container_width=True)
 
 # ============================== ИМПОРТ / ЭКСПОРТ ==============================
