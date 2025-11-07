@@ -148,6 +148,22 @@ def filter_edges_by_report(edges, report_id: int | None):
                 keep.add(s); changed = True
     return [(s,t,l) for s,t,l in edges if s in keep and t in keep]
 
+def filter_edges_by_report_name(edges, reports_df: pd.DataFrame, report_name: str | None):
+    """
+    Фильтрует рёбра для выбранного отчёта по его имени.
+    Если report_name == None или спец-значение — возвращаем все рёбра.
+    """
+    if not report_name or report_name.strip() in {"— Все отчёты —"}:
+        return edges
+
+    row = reports_df[reports_df["name"] == report_name]
+    if row.empty:
+        return edges
+
+    report_id = int(row.iloc[0]["report_id"])
+    return filter_edges_by_report(edges, report_id)
+
+
 # ====================== ТЕСТОВЫЕ ДАННЫЕ (можно заменить) ======================
 def load_default_frames():
     datasets = pd.DataFrame([
