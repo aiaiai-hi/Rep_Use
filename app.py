@@ -29,26 +29,40 @@ def download_button_for_df(df, label, filename):
 
 # ---------------- TF-IDF поисковый индекс ----------------
 def build_search_text(row, datasets):
-    ds = datasets[datasets.dataset_id == row["dataset_id"]].iloc[0]
-    return " ".join([
+    # безопасно на случай пропусков
+    try:
+        ds = datasets[datasets.dataset_id == row["dataset_id"]].iloc[0]
+        ds_name = str(ds.get("name",""))
+        ds_system = str(ds.get("system",""))
+    except Exception:
+        ds_name, ds_system = "", ""
+    tags = row.get("tags", [])
+    if isinstance(tags, str):
+        tags = [t.strip() for t in tags.split(",")] if tags else []
+    return " ".join(filter(None, [
         str(row.get("business_field_name","")),
         str(row.get("business_algorithm","")),
-        str(row["column"]),
-        " ".join(row.get("tags", [])) if isinstance(row.get("tags"), list) else str(row.get("tags","")),
-        f"{row['schema']}.{row['table']}",
-        str(ds["name"]),
-        str(ds["system"])
-    ])
+        str(row.get("column","")),
+        " ".join(tags),
+        f"{row.get('schema','')}.{row.get('table','')}",
+        ds_name,
+        ds_system
+    ]))
 
 def build_search_index(dataset_fields, datasets):
     df = dataset_fields.copy()
+    if df.empty:
+        # пустой индекс
+        vec = TfidfVectorizer()
+        tfidf = vec.fit_transform([""])
+        return vec, tfidf
     df["search_text"] = df.apply(lambda r: build_search_text(r, datasets), axis=1)
     vectorizer = TfidfVectorizer(ngram_range=(1,2), analyzer="word", min_df=1)
     tfidf = vectorizer.fit_transform(df["search_text"].astype(str).values)
     return vectorizer, tfidf
 
 def search_fields(query: str, dataset_fields, vectorizer, tfidf, top_k: int = 30):
-    if not query.strip():
+    if not query.strip() or len(dataset_fields)==0:
         return []
     q_vec = vectorizer.transform([query])
     sim = cosine_similarity(q_vec, tfidf).ravel()
@@ -61,7 +75,7 @@ def build_lineage_edges(dataset_fields: pd.DataFrame, report_fields: pd.DataFram
     dataset(schema.table) -> field(schema.table.column) -> report(report:<id>)
     """
     df = dataset_fields.copy()
-    df["dataset"] = df["schema"] + "." + df["table"]
+    df["dataset"] = df["schema"].astype(str) + "." + df["table"].astype(str)
     edges = []
     # dataset -> field
     for _, r in df.iterrows():
@@ -77,13 +91,12 @@ def build_lineage_edges(dataset_fields: pd.DataFrame, report_fields: pd.DataFram
 
 def pyvis_graph(edges, reports: pd.DataFrame, datasets: pd.DataFrame, height="650px"):
     g = Network(height=height, width="100%", bgcolor="#FFFFFF", font_color="#111111", notebook=False, directed=True)
-    # Физика/пружины
     try:
         g.barnes_hut(gravity=-20000, central_gravity=0.1, spring_length=150, spring_strength=0.01)
     except Exception:
         pass
 
-    ds_set = set(datasets["name"].tolist())
+    ds_set = set(datasets["name"].astype(str).tolist())
     report_meta = {f"report:{r.report_id}": r.name for _, r in reports.iterrows()}
 
     def node_style(n):
@@ -108,7 +121,6 @@ def pyvis_graph(edges, reports: pd.DataFrame, datasets: pd.DataFrame, height="65
                 nodes.add(n)
         g.add_edge(s, t, title=lbl, arrows="to")
 
-    # Настройки графа — передаём валидный JSON через json.dumps
     options = {
         "nodes": {"borderWidth": 1, "size": 18},
         "edges": {"color": {"color": "#B3B3B3"}, "smooth": {"type": "dynamic"}},
@@ -117,9 +129,7 @@ def pyvis_graph(edges, reports: pd.DataFrame, datasets: pd.DataFrame, height="65
     try:
         g.set_options(json.dumps(options, ensure_ascii=False))
     except Exception:
-        # не критично — PyVis отрисует по умолчанию
         pass
-
     return g
 
 def sankey_figure(edges):
@@ -149,20 +159,14 @@ def filter_edges_by_report(edges, report_id: int | None):
     return [(s,t,l) for s,t,l in edges if s in keep and t in keep]
 
 def filter_edges_by_report_name(edges, reports_df: pd.DataFrame, report_name: str | None):
-    """
-    Фильтрует рёбра для выбранного отчёта по его имени.
-    Если report_name == None или спец-значение — возвращаем все рёбра.
-    """
+    """Фильтрует рёбра для выбранного отчёта по имени; None → все рёбра."""
     if not report_name or report_name.strip() in {"— Все отчёты —"}:
         return edges
-
     row = reports_df[reports_df["name"] == report_name]
     if row.empty:
         return edges
-
     report_id = int(row.iloc[0]["report_id"])
     return filter_edges_by_report(edges, report_id)
-
 
 # ====================== ТЕСТОВЫЕ ДАННЫЕ (можно заменить) ======================
 def load_default_frames():
@@ -219,6 +223,8 @@ if "datasets" not in st.session_state:
     st.session_state.datasets, st.session_state.reports, st.session_state.report_fields, st.session_state.dataset_fields = load_default_frames()
 if "selected_refs" not in st.session_state:
     st.session_state.selected_refs = []
+if "is_admin" not in st.session_state:
+    st.session_state.is_admin = False
 
 datasets = st.session_state.datasets
 reports = st.session_state.reports
@@ -226,115 +232,129 @@ report_fields = st.session_state.report_fields
 dataset_fields = st.session_state.dataset_fields
 
 # Служебные поля
-dataset_fields["ref"] = dataset_fields["schema"] + "." + dataset_fields["table"] + "." + dataset_fields["column"]
-ref_to_dataset = {r["ref"]: r["dataset_id"] for _, r in dataset_fields.iterrows()}
+if {"schema","table","column"}.issubset(dataset_fields.columns):
+    dataset_fields["ref"] = dataset_fields["schema"].astype(str) + "." + dataset_fields["table"].astype(str) + "." + dataset_fields["column"].astype(str)
+else:
+    dataset_fields["ref"] = ""  # на случай неполных загрузок
+ref_to_dataset = {r["ref"]: r["dataset_id"] for _, r in dataset_fields.iterrows() if "dataset_id" in r and pd.notna(r["ref"])}
 
-# Строим/перестраиваем поисковый индекс
+# Строим/перестраиваем поисковый индекс (при первом запуске)
 if "vectorizer" not in st.session_state or "tfidf" not in st.session_state:
     st.session_state.vectorizer, st.session_state.tfidf = build_search_index(dataset_fields, datasets)
 
 vectorizer = st.session_state.vectorizer
 tfidf = st.session_state.tfidf
 
-# =============================== НАВИГАЦИЯ ====================================
-page = st.sidebar.radio("Страницы", ["Главная", "Импорт/Экспорт"])
+# ================================== ОДНА СТРАНИЦА ===================================
+st.title("Каталог данных и отчётов → Подбор по параметрам, прототип и линейность")
+st.caption("Подберите поля и соберите прототип отчёта, не зная заранее схемы и таблицы.")
 
-# ================================== ГЛАВНАЯ ===================================
-if page == "Главная":
-    st.title("Каталог данных и отчётов → Подбор по параметрам, прототип и линейность")
-    st.caption("Подберите поля и соберите прототип отчёта, не зная заранее схемы и таблицы.")
+# Табы одной страницы
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "🔎 Подбор по параметрам",
+    "🧱 Витрины",
+    "📋 Реестр отчётов",
+    "🗂️ Атрибуты отчёта",
+    "🧭 Линейность",
+    "📥 Импорт/Экспорт"
+])
 
-    # Табы
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "🔎 Подбор по параметрам",
-        "🧱 Витрины",
-        "📋 Реестр отчётов",
-        "🗂️ Атрибуты отчёта",
-        "🧭 Линейность"
-    ])
+# ------------------- TAB 1: Подбор по параметрам -------------------------
+with tab1:
+    st.subheader("Опишите что вы хотите")
+    st.caption("Введите названия показателей, измерений, систем или таблиц (например: «выручка», «канал продаж», «ERP себестоимость»).")
 
-    # ------------------- TAB 1: Подбор по параметрам -------------------------
-    with tab1:
-        st.subheader("Опишите что вы хотите")
-        st.caption("Введите названия показателей, измерений, систем или таблиц (например: «выручка», «канал продаж», «ERP себестоимость»).")
-
+    qcol1, qcol2 = st.columns([3,1])
+    with qcol1:
         q = st.text_input("Поиск по полям (семантический TF-IDF)", placeholder="Например: выручка, канал продаж, регион, себестоимость ...")
-        cols = st.columns([3,1])
-        with cols[0]:
-            if q:
-                results = search_fields(q, dataset_fields, vectorizer, tfidf, top_k=50)
-                if results:
-                    st.write("Найденные поля:")
-                    for ref, sc in results:
-                        ds_id = ref_to_dataset[ref]
-                        ds = datasets[datasets.dataset_id==ds_id].iloc[0]
-                        row = dataset_fields.set_index("ref").loc[ref]
-                        add_key = f"add_{ref}"
-                        with st.container():
-                            c1, c2, c3, c4, c5 = st.columns([3,2,1,1,1])
-                            c1.markdown(f"**{row.get('business_field_name','')}**  \n`{ref}`")
-                            c2.markdown(f"Система: **{ds['system']}**  \nНабор: `{ds['name']}`")
-                            c3.markdown(f"Слой: `{ds['layer']}`")
-                            c4.markdown(f"DQ: **{row['completeness']:.2f}**")
-                            c5.markdown(f"score: {sc:.2f}")
-                            if st.button("Добавить в прототип", key=add_key):
-                                if ref not in st.session_state.selected_refs:
-                                    st.session_state.selected_refs.append(ref)
-                else:
-                    st.info("Ничего не найдено. Попробуйте другие формулировки.")
+    with qcol2:
+        if st.button("🔄 Переиндексировать сейчас"):
+            st.session_state.vectorizer, st.session_state.tfidf = build_search_index(dataset_fields, datasets)
+            vectorizer = st.session_state.vectorizer
+            tfidf = st.session_state.tfidf
+            st.success("Индекс поиска перестроен.")
+
+    cols = st.columns([3,1])
+    with cols[0]:
+        if q:
+            results = search_fields(q, dataset_fields, vectorizer, tfidf, top_k=50)
+            if results:
+                st.write("Найденные поля:")
+                for ref, sc in results:
+                    if ref not in ref_to_dataset:
+                        continue
+                    ds_id = ref_to_dataset[ref]
+                    ds = datasets[datasets.dataset_id==ds_id].iloc[0] if not datasets[datasets.dataset_id==ds_id].empty else {}
+                    row = dataset_fields.set_index("ref").loc[ref]
+                    add_key = f"add_{ref}"
+                    with st.container():
+                        c1, c2, c3, c4, c5 = st.columns([3,2,1,1,1])
+                        c1.markdown(f"**{row.get('business_field_name','')}**  \n`{ref}`")
+                        c2.markdown(f"Система: **{ds.get('system','')}**  \nНабор: `{ds.get('name','')}`")
+                        c3.markdown(f"Слой: `{ds.get('layer','')}`")
+                        c4.markdown(f"DQ: **{row.get('completeness',0):.2f}**")
+                        c5.markdown(f"score: {sc:.2f}")
+                        if st.button("Добавить в прототип", key=add_key):
+                            if ref not in st.session_state.selected_refs:
+                                st.session_state.selected_refs.append(ref)
             else:
-                st.caption("Результаты появятся после ввода поискового запроса.")
-
-        with cols[1]:
-            if st.button("Очистить выбранные"):
-                st.session_state.selected_refs = []
-
-        st.markdown("---")
-        st.markdown("### Прототип отчёта")
-        if not st.session_state.selected_refs:
-            st.info("Добавляйте поля из результатов поиска — они появятся в таблице ниже.")
+                st.info("Ничего не найдено. Попробуйте другие формулировки или переиндексируйте.")
         else:
-            # Таблица прототипа с требуемыми колонками
-            rows = []
-            for i, ref in enumerate(st.session_state.selected_refs, start=1):
-                ds_id = ref_to_dataset[ref]
-                ds = datasets[datasets.dataset_id==ds_id].iloc[0]
-                rf = report_fields[report_fields["source_ref"]==ref]
-                used_ids = rf["report_id"].tolist()
-                used_names = reports[reports["report_id"].isin(used_ids)]["name"].tolist()
-                row = dataset_fields.set_index("ref").loc[ref]
-                rows.append({
-                    "№": i,
-                    "Бизнес-поле": row.get("business_field_name",""),
-                    "Бизнес-алгоритм": row.get("business_algorithm",""),
-                    "Источник (schema.table.column)": ref,
-                    "Связь с информационной системой": ds["system"],
-                    "В какую таблицу входит": f"{row['schema']}.{row['table']}",
-                    "В каких отчётах есть (ID)": ", ".join(map(str, used_ids)) if used_ids else "—",
-                    "Названия отчётов": ", ".join(used_names) if used_names else "—",
-                })
-            df_proto = pd.DataFrame(rows)
-            st.dataframe(df_proto, use_container_width=True, height=360)
-            download_button_for_df(df_proto, "⬇️ Скачать прототип (Excel)", "prototype.xlsx")
+            st.caption("Результаты появятся после ввода поискового запроса.")
 
-    # ------------------- TAB 2: Витрины --------------------------------------
-    with tab2:
-        c1, c2 = st.columns(2)
-        with c1:
-            st.write("**Витрина (dm.*)**")
-            st.dataframe(datasets.query("layer=='vitrine'")[["name","system","owner","sla_minutes","pii_flags","quality_score","granularity"]]
-                         .rename(columns={"name":"Набор","system":"Система","owner":"Владелец","sla_minutes":"SLA (мин)","pii_flags":"PII","quality_score":"Качество","granularity":"Гранулярность"}),
-                         use_container_width=True, height=260)
-        with c2:
-            st.write("**Источники (RAW/Source)**")
-            st.dataframe(datasets.query("layer!='vitrine'")[["name","system","owner","sla_minutes","pii_flags","quality_score","granularity"]]
-                         .rename(columns={"name":"Набор","system":"Система","owner":"Владелец","sla_minutes":"SLA (мин)","pii_flags":"PII","quality_score":"Качество","granularity":"Гранулярность"}),
-                         use_container_width=True, height=260)
+    with cols[1]:
+        if st.button("Очистить выбранные"):
+            st.session_state.selected_refs = []
 
-        st.markdown("### Поля")
-        df_fields = dataset_fields.copy()
+    st.markdown("---")
+    st.markdown("### Прототип отчёта")
+    if not st.session_state.selected_refs:
+        st.info("Добавляйте поля из результатов поиска — они появятся в таблице ниже.")
+    else:
+        # Таблица прототипа с требуемыми колонками
+        rows = []
+        for i, ref in enumerate(st.session_state.selected_refs, start=1):
+            if ref not in ref_to_dataset or ref not in dataset_fields.set_index("ref").index:
+                continue
+            ds_id = ref_to_dataset[ref]
+            ds_row = datasets[datasets.dataset_id==ds_id]
+            ds = ds_row.iloc[0] if not ds_row.empty else {}
+            rf = report_fields[report_fields["source_ref"]==ref]
+            used_ids = rf["report_id"].tolist()
+            used_names = reports[reports["report_id"].isin(used_ids)]["name"].tolist()
+            row = dataset_fields.set_index("ref").loc[ref]
+            rows.append({
+                "№": i,
+                "Бизнес-поле": row.get("business_field_name",""),
+                "Бизнес-алгоритм": row.get("business_algorithm",""),
+                "Источник (schema.table.column)": ref,
+                "Связь с информационной системой": ds.get("system",""),
+                "В какую таблицу входит": f"{row.get('schema','')}.{row.get('table','')}",
+                "В каких отчётах есть (ID)": ", ".join(map(str, used_ids)) if used_ids else "—",
+                "Названия отчётов": ", ".join(used_names) if used_names else "—",
+            })
+        df_proto = pd.DataFrame(rows)
+        st.dataframe(df_proto, use_container_width=True, height=360)
+        download_button_for_df(df_proto, "⬇️ Скачать прототип (Excel)", "prototype.xlsx")
+
+# ------------------- TAB 2: Витрины --------------------------------------
+with tab2:
+    c1, c2 = st.columns(2)
+    with c1:
+        st.write("**Витрина (dm.*)**")
+        st.dataframe(datasets.query("layer=='vitrine'")[["name","system","owner","sla_minutes","pii_flags","quality_score","granularity"]]
+                     .rename(columns={"name":"Набор","system":"Система","owner":"Владелец","sla_minutes":"SLA (мин)","pii_flags":"PII","quality_score":"Качество","granularity":"Гранулярность"}),
+                     use_container_width=True, height=260)
+    with c2:
+        st.write("**Источники (RAW/Source)**")
+        st.dataframe(datasets.query("layer!='vitrine'")[["name","system","owner","sla_minutes","pii_flags","quality_score","granularity"]]
+                     .rename(columns={"name":"Набор","system":"Система","owner":"Владелец","sla_minutes":"SLA (мин)","pii_flags":"PII","quality_score":"Качество","granularity":"Гранулярность"}),
+                     use_container_width=True, height=260)
+
+    st.markdown("### Поля")
+    df_fields = dataset_fields.copy()
+    if not df_fields.empty:
         df_fields.insert(0, "№", range(1, len(df_fields)+1))
-        # Колонки: после нумерации — Бизнес-поле, Бизнес-алгоритм, затем схема/таблица/поле и пр.
         df_fields = df_fields[["№","business_field_name","business_algorithm","schema","table","column","dtype","completeness","uniqueness","tags"]]
         df_fields = df_fields.rename(columns={
             "business_field_name":"Бизнес-поле",
@@ -342,188 +362,206 @@ if page == "Главная":
             "schema":"Схема","table":"Таблица","column":"Поле","dtype":"Тип",
             "completeness":"Полнота","uniqueness":"Уникальность","tags":"Теги"
         })
-        st.dataframe(df_fields, use_container_width=True, height=360)
+    st.dataframe(df_fields, use_container_width=True, height=360)
 
-    # ------------------- TAB 3: Реестр отчётов (поисковый фильтр) -------------
-    with tab3:
-        st.write("### Реестр отчётов")
-        query = st.text_input("Фильтр по наименованию/владельцу/домену", "")
-        show = reports.copy()
-        if query:
-            ql = query.lower()
-            mask = (
-                show["name"].str.lower().str.contains(ql) |
-                show["owner"].str.lower().str.contains(ql) |
-                show["business_domain"].str.lower().str.contains(ql)
-            )
-            show = show[mask]
-        grid = show[["name","owner","business_domain","frequency","is_automated","automation_score","description"]].rename(
-            columns={"name":"Наименование","owner":"Владелец","business_domain":"Домен","frequency":"Частота","is_automated":"Авто?","automation_score":"Скор","description":"Описание"})
-        st.dataframe(grid, use_container_width=True, height=300)
+# ------------------- TAB 3: Реестр отчётов -----------------------------
+with tab3:
+    st.write("### Реестр отчётов")
+    query = st.text_input("Фильтр по наименованию/владельцу/домену", "")
+    show = reports.copy()
+    if query:
+        ql = query.lower()
+        for col in ["name","owner","business_domain"]:
+            if col not in show.columns:
+                show[col] = ""
+        mask = (
+            show["name"].astype(str).str.lower().str.contains(ql) |
+            show["owner"].astype(str).str.lower().str.contains(ql) |
+            show["business_domain"].astype(str).str.lower().str.contains(ql)
+        )
+        show = show[mask]
+    grid = show[["name","owner","business_domain","frequency","is_automated","automation_score","description"]].rename(
+        columns={"name":"Наименование","owner":"Владелец","business_domain":"Домен","frequency":"Частота","is_automated":"Авто?","automation_score":"Скор","description":"Описание"})
+    st.dataframe(grid, use_container_width=True, height=300)
 
-    # ------------------- TAB 4: Атрибуты отчёта (поиск + выгрузка) ------------
-    with tab4:
-        selected = st.selectbox("Выберите отчёт", options=reports["name"].tolist())
-        rep = reports[reports["name"]==selected].iloc[0]
-        rid = rep["report_id"]
-        st.write(f"**Владелец:** {rep['owner']}  ·  **Частота:** {rep['frequency']}  ·  **Статус:** {'Автоматизирован' if rep['is_automated'] else 'Ручной'}")
-        st.caption(rep["description"])
+# ------------------- TAB 4: Атрибуты отчёта ----------------------------
+with tab4:
+    selected = st.selectbox("Выберите отчёт", options=reports["name"].astype(str).tolist())
+    rep = reports[reports["name"]==selected].iloc[0]
+    rid = rep["report_id"]
+    st.write(f"**Владелец:** {rep.get('owner','')}  ·  **Частота:** {rep.get('frequency','')}  ·  **Статус:** {'Автоматизирован' if rep.get('is_automated',False) else 'Ручной'}")
+    st.caption(rep.get("description",""))
 
-        rf = report_fields[report_fields["report_id"]==rid].copy()
-        rf["Наименование отчёта"] = rep["name"]
-        rf = rf.rename(columns={
-            "report_id":"Код отчёта",
-            "business_field_name":"Бизнес-поле",
-            "business_algorithm":"Бизнес-алгоритм",
-            "source_ref":"Источник (schema.table.column)",
-            "is_from_vitrine":"Из витрины?"
-        })
-        # Порядок: Бизнес-алгоритм → Код отчёта → Наименование отчёта → ...
-        rf = rf[["Бизнес-поле","Бизнес-алгоритм","Код отчёта","Наименование отчёта","Источник (schema.table.column)","Из витрины?"]]
+    rf = report_fields[report_fields["report_id"]==rid].copy()
+    rf["Наименование отчёта"] = rep["name"]
+    rf = rf.rename(columns={
+        "report_id":"Код отчёта",
+        "business_field_name":"Бизнес-поле",
+        "business_algorithm":"Бизнес-алгоритм",
+        "source_ref":"Источник (schema.table.column)",
+        "is_from_vitrine":"Из витрины?"
+    })
+    # ВАЖНО: вернуть Источник, и поставить его ПОСЛЕ "Из витрины?"
+    cols_order = ["Бизнес-поле","Бизнес-алгоритм","Код отчёта","Наименование отчёта","Из витрины?","Источник (schema.table.column)"]
+    rf = rf[[c for c in cols_order if c in rf.columns]]
 
-        attr_filter = st.text_input("Фильтр по атрибутам (поле/алгоритм/источник)")
-        if attr_filter:
-            ql = attr_filter.lower()
-            mask = (
-                rf["Бизнес-поле"].str.lower().str.contains(ql) |
-                rf["Бизнес-алгоритм"].str.lower().str.contains(ql) |
-                rf["Источник (schema.table.column)"].str.lower().str.contains(ql)
-            )
-            rf_view = rf[mask]
-        else:
-            rf_view = rf
+    attr_filter = st.text_input("Фильтр по атрибутам (поле/алгоритм/источник)")
+    if attr_filter:
+        ql = attr_filter.lower()
+        def safe_contains(s): return s.astype(str).str.lower().str.contains(ql)
+        mask = pd.Series([False]*len(rf))
+        for c in rf.columns:
+            mask = mask | safe_contains(rf[c])
+        rf_view = rf[mask]
+    else:
+        rf_view = rf
 
-        st.dataframe(rf_view, use_container_width=True, height=280)
-        download_button_for_df(rf_view, "⬇️ Скачать атрибуты отчёта (Excel)", f"report_{rid}_attrs.xlsx")
+    st.dataframe(rf_view, use_container_width=True, height=280)
+    download_button_for_df(rf_view, "⬇️ Скачать атрибуты отчёта (Excel)", f"report_{rid}_attrs.xlsx")
 
-    # ------------------- TAB 5: Линейность -----------------------------------
-    # ------------------- TAB 5: Линейность -----------------------------------
-    with tab5:
-        st.subheader("Data Lineage")
-    
-        # Явный выбор отчёта всегда виден: первое значение — глобальный режим
-        report_options = ["— Все отчёты —"] + reports["name"].dropna().astype(str).unique().tolist()
-        selected_report_name = st.selectbox("Отчёт для фильтрации (по умолчанию — все)", options=report_options, index=0)
-    
-        # (необязательно) Доп. фильтры по слоям/системам — можешь расширить позже
-        colf1, colf2 = st.columns(2)
-        with colf1:
-            layer_filter = st.multiselect("Слой", ["vitrine","raw"], default=["vitrine","raw"])
-        with colf2:
-            systems = sorted(datasets["system"].dropna().unique().tolist())
-            system_filter = st.multiselect("Система", systems, default=systems)
-    
-        # строим полный граф
-        edges_all = build_lineage_edges(dataset_fields, report_fields)
-    
-        # применяем фильтр по отчёту
-        edges = filter_edges_by_report_name(edges_all, reports, None if selected_report_name == "— Все отчёты —" else selected_report_name)
-    
-        # (необязательно) применим простую фильтрацию по слоям/системам
-        if layer_filter or system_filter:
-            # Для эффективности построим множества допустимых датасетов
-            allowed_ds = set(
-                datasets[(datasets["layer"].isin(layer_filter)) & (datasets["system"].isin(system_filter))]["name"].tolist()
-            )
-            def edge_ok(s, t):
-                # Разрешаем, если dataset в allowed_ds, либо это не dataset-узел
-                def is_dataset(n): return isinstance(n, str) and (n.count(".")==1)  # schema.table
-                if is_dataset(s) and s not in allowed_ds:
-                    return False
-                return True
-            edges = [e for e in edges if edge_ok(e[0], e[1])]
-    
-        viz = st.radio("Тип визуализации", ["Граф (интерактивный)", "Sankey"], horizontal=True)
-    
-        if viz == "Граф (интерактивный)":
-            net = pyvis_graph(edges, reports, datasets, height="650px")
-            # Безопасный рендер HTML для разных версий pyvis
-            html = None
-            if hasattr(net, "generate_html"):
-                try:
-                    html = net.generate_html(notebook=False)
-                except Exception:
-                    html = None
-            if html is None:
-                tmp_path = "lineage_tmp.html"
-                try:
-                    net.write_html(tmp_path)
-                    with open(tmp_path, "r", encoding="utf-8") as f:
-                        html = f.read()
-                except Exception:
-                    html = "<html><body><p>Не удалось сгенерировать граф PyVis.</p></body></html>"
-    
-            st.caption(f"Показано: {selected_report_name if selected_report_name!='— Все отчёты —' else 'все отчёты'}")
-            components.html(html, height=680, scrolling=True)
-            st.download_button(
-                "⬇️ Скачать граф (HTML)",
-                data=html.encode("utf-8"),
-                file_name=f"lineage_{'all' if selected_report_name=='— Все отчёты —' else selected_report_name}.html",
-                mime="text/html"
-            )
-        else:
-            fig = sankey_figure(edges)
-            st.caption(f"Показано: {selected_report_name if selected_report_name!='— Все отчёты —' else 'все отчёты'}")
-            st.plotly_chart(fig, use_container_width=True)
+# ------------------- TAB 5: Линейность -----------------------------------
+with tab5:
+    st.subheader("Data Lineage")
 
-# ============================== ИМПОРТ / ЭКСПОРТ ==============================
-else:
-    st.title("Импорт/Экспорт")
-    st.caption("Загрузите Excel-файлы, чтобы заменить тестовые данные. Также можно скачать шаблоны для заполнения.")
+    report_options = ["— Все отчёты —"] + reports["name"].dropna().astype(str).unique().tolist()
+    selected_report_name = st.selectbox("Отчёт для фильтрации (по умолчанию — все)", options=report_options, index=0)
 
-    st.markdown("#### Шаблоны для выгрузки")
-    template_datasets = pd.DataFrame([{
-        "dataset_id":"","name":"","layer":"","owner":"","sla_minutes":"","pii_flags":"","quality_score":"","granularity":"","system":""
-    }])
-    template_dataset_fields = pd.DataFrame([{
-        "dataset_id":"","schema":"","table":"","column":"","dtype":"",
-        "completeness":"","uniqueness":"","tags":"список_через_запятую",
-        "business_field_name":"","business_algorithm":""
-    }])
-    template_reports = pd.DataFrame([{
-        "report_id":"","name":"","owner":"","frequency":"","business_domain":"",
-        "is_automated":"","automation_score":"","description":""
-    }])
-    template_report_fields = pd.DataFrame([{
-        "report_id":"","business_field_name":"","business_algorithm":"",
-        "source_ref":"","is_from_vitrine":""
-    }])
+    colf1, colf2 = st.columns(2)
+    with colf1:
+        layer_filter = st.multiselect("Слой", ["vitrine","raw"], default=["vitrine","raw"])
+    with colf2:
+        systems = sorted(datasets["system"].dropna().astype(str).unique().tolist()) if "system" in datasets.columns else []
+        system_filter = st.multiselect("Система", systems, default=systems)
 
-    c1, c2, c3, c4 = st.columns(4)
-    with c1: download_button_for_df(template_datasets, "⬇️ Шаблон: datasets.xlsx", "datasets_template.xlsx")
-    with c2: download_button_for_df(template_dataset_fields, "⬇️ Шаблон: dataset_fields.xlsx", "dataset_fields_template.xlsx")
-    with c3: download_button_for_df(template_reports, "⬇️ Шаблон: reports.xlsx", "reports_template.xlsx")
-    with c4: download_button_for_df(template_report_fields, "⬇️ Шаблон: report_fields.xlsx", "report_fields_template.xlsx")
+    edges_all = build_lineage_edges(dataset_fields, report_fields)
+    edges = filter_edges_by_report_name(edges_all, reports, None if selected_report_name == "— Все отчёты —" else selected_report_name)
 
-    st.markdown("---")
-    st.markdown("#### Импорт Excel")
-    st.caption("Ожидаются отдельные файлы с соответствующими столбцами. Теги можно указывать через запятую.")
+    if layer_filter or system_filter:
+        allowed_ds = set(
+            datasets[(datasets["layer"].isin(layer_filter)) & (datasets["system"].isin(system_filter))]["name"].astype(str).tolist()
+        ) if not datasets.empty else set()
+        def edge_ok(s, t):
+            def is_dataset(n): return isinstance(n, str) and (n.count(".")==1)
+            if is_dataset(s) and allowed_ds and s not in allowed_ds:
+                return False
+            return True
+        edges = [e for e in edges if edge_ok(e[0], e[1])]
 
-    up1 = st.file_uploader("Загрузите datasets.xlsx", type=["xlsx"])
-    up2 = st.file_uploader("Загрузите dataset_fields.xlsx", type=["xlsx"])
-    up3 = st.file_uploader("Загрузите reports.xlsx", type=["xlsx"])
-    up4 = st.file_uploader("Загрузите report_fields.xlsx", type=["xlsx"])
+    viz = st.radio("Тип визуализации", ["Граф (интерактивный)", "Sankey"], horizontal=True)
 
-    if st.button("Заменить тестовые данные на загруженные"):
-        try:
-            if up1: st.session_state.datasets = pd.read_excel(up1)
-            if up2:
-                df = pd.read_excel(up2)
-                if "tags" in df.columns:
-                    df["tags"] = df["tags"].apply(lambda x: [t.strip() for t in str(x).split(",")] if pd.notna(x) else [])
-                st.session_state.dataset_fields = df
-            if up3: st.session_state.reports = pd.read_excel(up3)
-            if up4: st.session_state.report_fields = pd.read_excel(up4)
+    if viz == "Граф (интерактивный)":
+        net = pyvis_graph(edges, reports, datasets, height="650px")
+        html = None
+        if hasattr(net, "generate_html"):
+            try:
+                html = net.generate_html(notebook=False)
+            except Exception:
+                html = None
+        if html is None:
+            tmp_path = "lineage_tmp.html"
+            try:
+                net.write_html(tmp_path)
+                with open(tmp_path, "r", encoding="utf-8") as f:
+                    html = f.read()
+            except Exception:
+                html = "<html><body><p>Не удалось сгенерировать граф PyVis.</p></body></html>"
 
-            # Пересоберём служебные поля/индекс
-            st.session_state.dataset_fields["ref"] = (
-                st.session_state.dataset_fields["schema"] + "." +
-                st.session_state.dataset_fields["table"] + "." +
-                st.session_state.dataset_fields["column"]
-            )
-            st.session_state.vectorizer, st.session_state.tfidf = build_search_index(
-                st.session_state.dataset_fields, st.session_state.datasets
-            )
-            st.success("Данные обновлены. Перейдите на страницу «Главная».")
-        except Exception as e:
-            st.error(f"Ошибка загрузки: {e}")
+        st.caption(f"Показано: {selected_report_name if selected_report_name!='— Все отчёты —' else 'все отчёты'}")
+        components.html(html, height=680, scrolling=True)
+        st.download_button(
+            "⬇️ Скачать граф (HTML)",
+            data=html.encode("utf-8"),
+            file_name=f"lineage_{'all' if selected_report_name=='— Все отчёты —' else selected_report_name}.html",
+            mime="text/html"
+        )
+    else:
+        fig = sankey_figure(edges)
+        st.caption(f"Показано: {selected_report_name if selected_report_name!='— Все отчёты —' else 'все отчёты'}")
+        st.plotly_chart(fig, use_container_width=True)
+
+# ------------------- TAB 6: Импорт/Экспорт (login admin / 321) -------------
+with tab6:
+    st.subheader("Импорт/Экспорт")
+
+    if not st.session_state.is_admin:
+        colu1, colu2 = st.columns(2)
+        with colu1:
+            login = st.text_input("Логин")
+        with colu2:
+            pwd = st.text_input("Пароль", type="password")
+        if st.button("Войти"):
+            if login.strip()=="admin" and pwd=="321":
+                st.session_state.is_admin = True
+                st.success("Доступ разрешён.")
+            else:
+                st.error("Неверные логин или пароль.")
+        st.info("Доступ к загрузке данных — только для администратора.")
+    else:
+        st.success("Вы вошли как admin.")
+
+        st.markdown("#### Шаблоны для выгрузки")
+        template_datasets = pd.DataFrame([{
+            "dataset_id":"","name":"","layer":"","owner":"","sla_minutes":"","pii_flags":"","quality_score":"","granularity":"","system":""
+        }])
+        template_dataset_fields = pd.DataFrame([{
+            "dataset_id":"","schema":"","table":"","column":"","dtype":"",
+            "completeness":"","uniqueness":"","tags":"список_через_запятую",
+            "business_field_name":"","business_algorithm":""
+        }])
+        template_reports = pd.DataFrame([{
+            "report_id":"","name":"","owner":"","frequency":"","business_domain":"",
+            "is_automated":"","automation_score":"","description":""
+        }])
+        template_report_fields = pd.DataFrame([{
+            "report_id":"","business_field_name":"","business_algorithm":"",
+            "source_ref":"","is_from_vitrine":""
+        }])
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1: download_button_for_df(template_datasets, "⬇️ Шаблон: datasets.xlsx", "datasets_template.xlsx")
+        with c2: download_button_for_df(template_dataset_fields, "⬇️ Шаблон: dataset_fields.xlsx", "dataset_fields_template.xlsx")
+        with c3: download_button_for_df(template_reports, "⬇️ Шаблон: reports.xlsx", "reports_template.xlsx")
+        with c4: download_button_for_df(template_report_fields, "⬇️ Шаблон: report_fields.xlsx", "report_fields_template.xlsx")
+
+        st.markdown("---")
+        st.markdown("#### Импорт Excel")
+        st.caption("Загрузите Excel-файлы. Теги можно указывать через запятую.")
+
+        up1 = st.file_uploader("datasets.xlsx", type=["xlsx"])
+        up2 = st.file_uploader("dataset_fields.xlsx", type=["xlsx"])
+        up3 = st.file_uploader("reports.xlsx", type=["xlsx"])
+        up4 = st.file_uploader("report_fields.xlsx", type=["xlsx"])
+
+        if st.button("Заменить тестовые данные на загруженные"):
+            try:
+                if up1:
+                    st.session_state.datasets = pd.read_excel(up1)
+                if up2:
+                    df = pd.read_excel(up2)
+                    if "tags" in df.columns:
+                        df["tags"] = df["tags"].apply(lambda x: [t.strip() for t in str(x).split(",")] if pd.notna(x) else [])
+                    st.session_state.dataset_fields = df
+                if up3:
+                    st.session_state.reports = pd.read_excel(up3)
+                if up4:
+                    st.session_state.report_fields = pd.read_excel(up4)
+
+                # Обновим локальные ссылки
+                datasets = st.session_state.datasets
+                reports = st.session_state.reports
+                report_fields = st.session_state.report_fields
+                dataset_fields = st.session_state.dataset_fields
+
+                # Пересоберём служебные поля/индекс
+                if {"schema","table","column"}.issubset(dataset_fields.columns):
+                    dataset_fields["ref"] = dataset_fields["schema"].astype(str) + "." + dataset_fields["table"].astype(str) + "." + dataset_fields["column"].astype(str)
+                else:
+                    dataset_fields["ref"] = ""
+                st.session_state.dataset_fields = dataset_fields
+
+                # Переиндексация поиска — КЛЮЧЕВОЕ, чтобы поиск не ломался после замены данных
+                st.session_state.vectorizer, st.session_state.tfidf = build_search_index(dataset_fields, datasets)
+
+                st.success("Данные обновлены и индекс перестроен. Перейдите на другие вкладки.")
+            except Exception as e:
+                st.error(f"Ошибка загрузки: {e}")
