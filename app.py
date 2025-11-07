@@ -1,4 +1,5 @@
 # app.py
+import json
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
@@ -76,7 +77,11 @@ def build_lineage_edges(dataset_fields: pd.DataFrame, report_fields: pd.DataFram
 
 def pyvis_graph(edges, reports: pd.DataFrame, datasets: pd.DataFrame, height="650px"):
     g = Network(height=height, width="100%", bgcolor="#FFFFFF", font_color="#111111", notebook=False, directed=True)
-    g.barnes_hut(gravity=-20000, central_gravity=0.1, spring_length=150, spring_strength=0.01)
+    # Физика/пружины
+    try:
+        g.barnes_hut(gravity=-20000, central_gravity=0.1, spring_length=150, spring_strength=0.01)
+    except Exception:
+        pass
 
     ds_set = set(datasets["name"].tolist())
     report_meta = {f"report:{r.report_id}": r.name for _, r in reports.iterrows()}
@@ -84,9 +89,9 @@ def pyvis_graph(edges, reports: pd.DataFrame, datasets: pd.DataFrame, height="65
     def node_style(n):
         if n in ds_set:             # dataset
             return dict(color="#1f77b4", shape="box")
-        if n.startswith("report:"): # report
+        if isinstance(n, str) and n.startswith("report:"): # report
             return dict(color="#2ca02c", shape="box")
-        if n.count(".") == 2:       # field
+        if isinstance(n, str) and n.count(".") == 2:       # field
             return dict(color="#ff7f0e", shape="ellipse")
         return dict(color="#7f7f7f", shape="dot")
 
@@ -98,19 +103,22 @@ def pyvis_graph(edges, reports: pd.DataFrame, datasets: pd.DataFrame, height="65
                 title = n
                 if n in report_meta:
                     title = f"{n} | {report_meta[n]}"
-                label = n.split(".")[-1] if n.count(".")>=1 else (report_meta.get(n,n))
+                label = n.split(".")[-1] if isinstance(n, str) and n.count(".")>=1 else (report_meta.get(n, str(n)))
                 g.add_node(n, label=label, title=title, **style)
                 nodes.add(n)
         g.add_edge(s, t, title=lbl, arrows="to")
 
-        # Настройки графа: ВАЖНО — строго JSON, без "var options ="
-        g.set_options("""
-        {
-          "nodes": { "borderWidth": 1, "size": 18 },
-          "edges": { "color": { "color": "#B3B3B3" }, "smooth": { "type": "dynamic" } },
-          "physics": { "stabilization": true }
-        }
-        """)
+    # Настройки графа — передаём валидный JSON через json.dumps
+    options = {
+        "nodes": {"borderWidth": 1, "size": 18},
+        "edges": {"color": {"color": "#B3B3B3"}, "smooth": {"type": "dynamic"}},
+        "physics": {"stabilization": True}
+    }
+    try:
+        g.set_options(json.dumps(options, ensure_ascii=False))
+    except Exception:
+        # не критично — PyVis отрисует по умолчанию
+        pass
 
     return g
 
@@ -121,13 +129,15 @@ def sankey_figure(edges):
     target = [idx[t] for _,t,_ in edges]
     value  = [1 for _ in edges]
     fig = go.Figure(data=[go.Sankey(
-        node=dict(pad=15, thickness=20, line=dict(width=0.5), label=nodes),
+        node=dict(pad=15, thickness=20, line=dict(width=0.5), label=[str(n) for n in nodes]),
         link=dict(source=source, target=target, value=value)
     )])
     fig.update_layout(height=650, margin=dict(l=10,r=10,t=10,b=10))
     return fig
 
-def filter_edges_by_report(edges, report_id: int):
+def filter_edges_by_report(edges, report_id: int | None):
+    if report_id is None:
+        return edges
     rnode = f"report:{report_id}"
     keep = set([rnode])
     changed = True
@@ -382,13 +392,29 @@ if page == "Главная":
             rid = None
 
         edges_all = build_lineage_edges(dataset_fields, report_fields)
-        edges = filter_edges_by_report(edges_all, rid) if rid else edges_all
+        edges = filter_edges_by_report(edges_all, rid)
 
         viz = st.radio("Тип визуализации", ["Граф (интерактивный)", "Sankey"], horizontal=True)
 
         if viz == "Граф (интерактивный)":
             net = pyvis_graph(edges, reports, datasets, height="650px")
-            html = net.generate_html(notebook=False)
+            # Безопасный рендер HTML для разных версий pyvis
+            html = None
+            if hasattr(net, "generate_html"):
+                try:
+                    html = net.generate_html(notebook=False)
+                except Exception:
+                    html = None
+            if html is None:
+                # fallback: пишем файл и читаем
+                tmp_path = "lineage_tmp.html"
+                try:
+                    net.write_html(tmp_path)
+                    with open(tmp_path, "r", encoding="utf-8") as f:
+                        html = f.read()
+                except Exception:
+                    html = "<html><body><p>Не удалось сгенерировать граф PyVis.</p></body></html>"
+
             components.html(html, height=680, scrolling=True)
             st.download_button(
                 "⬇️ Скачать граф (HTML)",
