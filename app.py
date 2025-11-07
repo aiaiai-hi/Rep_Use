@@ -103,13 +103,15 @@ def pyvis_graph(edges, reports: pd.DataFrame, datasets: pd.DataFrame, height="65
                 nodes.add(n)
         g.add_edge(s, t, title=lbl, arrows="to")
 
+        # Настройки графа: ВАЖНО — строго JSON, без "var options ="
     g.set_options("""
-    var options = {
-      nodes: { borderWidth: 1, size: 18 },
-      edges: { color: { color: "#B3B3B3" }, smooth: { type: "dynamic" } },
-      physics: { stabilization: true }
+    {
+      "nodes": { "borderWidth": 1, "size": 18 },
+      "edges": { "color": { "color": "#B3B3B3" }, "smooth": { "type": "dynamic" } },
+      "physics": { "stabilization": true }
     }
     """)
+
     return g
 
 def sankey_figure(edges):
